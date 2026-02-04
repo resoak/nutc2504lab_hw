@@ -125,7 +125,7 @@ if __name__ == "__main__":
     
     # 初始路徑
     initial_input = {
-        "audio_path": "/home/pc-49/Desktop/nutc2504_lab/nutc2504lab_hw/HW/day3/Podcast_EP14_30s.wav"
+        "audio_path": "/home/pc-49/Downloads/Podcast_EP14_30s.wav"
     }
     
     print("\n--- 開始處理會議記錄 ---")
