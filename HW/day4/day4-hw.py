@@ -2,162 +2,189 @@ import os
 import json
 import base64
 import requests
-from typing import List, TypedDict, Literal
+from typing import TypedDict, List, Annotated
+import operator
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import HumanMessage
 from langgraph.graph import StateGraph, END
 from playwright.sync_api import sync_playwright
 
-# --- 1. 設定區域 ---
+# --- 1. 環境設定 ---
 SEARXNG_URL = "https://puli-8080.huannago.com/search"
+CACHE_FILE = "qa_cache.json"
 
-# 請確保 API Key 正確
 llm = ChatOpenAI(
     base_url="https://ws-05.huannago.com/v1",
-    api_key="your_api_key_here", 
+    api_key="YOUR_API_KEY", 
     model="google/gemma-3-27b-it",
-    temperature=0
+    temperature=0 
 )
 
 # --- 2. 狀態定義 ---
-class AgentState(TypedDict):
-    question: str
-    keywords: str
+class State(TypedDict):
+    input_query: str
     knowledge_base: str
-    cache_hit: bool
+    keywords: List[str]
+    search_links: List[dict]
+    visited_urls: Annotated[List[str], operator.add]
     final_answer: str
-    count: int 
-    feedback: str  # 儲存 LLM 的思考反饋
+    is_sufficient: bool 
+    loop_count: int
 
-# --- 3. 核心工具函數 ---
-def search_searxng(query: str, limit: int = 2):
-    params = {"q": query, "format": "json", "language": "zh-TW"}
-    try:
-        response = requests.get(SEARXNG_URL, params=params, timeout=10)
-        return [r for r in response.json().get('results', []) if 'url' in r][:limit]
-    except Exception as e:
-        print(f"❌ 搜尋出錯: {e}")
-        return []
-
-def vlm_analyze_page(url: str, question: str):
-    print(f"📸 [VLM] 啟動視覺閱讀: {url}")
+# --- 3. 核心工具 ---
+def internal_vlm_read_website(url: str, original_query: str) -> str:
     try:
         with sync_playwright() as p:
             browser = p.chromium.launch(headless=True)
-            page = browser.new_page(viewport={'width': 1280, 'height': 800})
-            page.goto(url, wait_until="domcontentloaded", timeout=15000)
-            page.wait_for_timeout(2000)
-            img_b64 = base64.b64encode(page.screenshot()).decode('utf-8')
+            page = browser.new_page()
+            page.set_viewport_size({"width": 1280, "height": 900})
+            page.goto(url, wait_until="domcontentloaded", timeout=30000)
+            page.wait_for_timeout(3000)
+            b64 = base64.b64encode(page.screenshot()).decode('utf-8')
             browser.close()
             
-            msg = HumanMessage(content=[
-                {"type": "text", "text": f"分析此截圖內容並針對問題 '{question}' 提供關鍵資訊。"},
-                {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{img_b64}"}}
-            ])
-            return llm.invoke([msg]).content
-    except Exception as e:
-        return f"網頁閱讀失敗: {e}"
+            msg = [
+                {"type": "text", "text": f"""你是一位事實分析官。請針對用戶的問題「{original_query}」分析此網頁截圖：
+                1. **來源性質**：該網頁是否為官方發布、權威報導或一般社群討論？
+                2. **核心事實**：提取所有與問題相關的時間、數據或事件狀態。
+                3. **變化記錄**：若問題涉及變動，請精確記錄「變動前」與「變動後」的具體內容。
+                4. **可信度**：內容中是否有標註『傳聞』、『猜測』或『非官方證實』等字眼？"""},
+                {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64}"}}
+            ]
+            res = llm.invoke([HumanMessage(content=msg)])
+            return res.content
+    except Exception as e: return f"讀取錯誤: {e}"
 
-# --- 4. LangGraph 節點實作 ---
-def check_cache(state: AgentState):
-    print("\n[Node] 1. 檢查快取...")
-    return {"cache_hit": False, "knowledge_base": "", "count": 0, "feedback": ""}
+# --- 4. 流程節點實現 (完全不含標的資訊) ---
 
-def query_gen(state: AgentState):
-    new_count = state.get("count", 0) + 1
-    fb = f"\n前次思考反饋：{state['feedback']}" if state['feedback'] else ""
-    print(f"🔄 [Node] 2. 第 {new_count}/3 次搜尋 - 生成關鍵字...")
+def check_cache_node(state: State):
+    print(f"🔎 [步驟 1] 檢查快取...")
+    if os.path.exists(CACHE_FILE):
+        with open(CACHE_FILE, "r", encoding="utf-8") as f:
+            cache = json.load(f)
+            if state['input_query'] in cache:
+                print("🎯 [命中快取]")
+                return {"final_answer": cache[state['input_query']]}
+    return {"knowledge_base": "", "loop_count": 0, "visited_urls": []}
+
+def planner_node(state: State):
+    if state['loop_count'] >= 5: return {"is_sufficient": True}
+
+    print(f"🧠 [步驟 2] 決策評估 (第 {state['loop_count']} 輪)...")
+    prompt = f"""用戶問題：{state['input_query']}
+    當前收集資訊：{state['knowledge_base']}
     
-    prompt = f"問題：'{state['question']}'{fb}\n請產出一個精準的搜尋關鍵字（僅輸出字串內容）。"
-    keyword = llm.invoke(prompt).content.strip().replace('"', '')
-    return {"keywords": keyword, "count": new_count}
-
-def search_tool(state: AgentState):
-    print(f"🔍 [Node] 3. 執行檢索: {state['keywords']}")
-    results = search_searxng(state['keywords'])
-    info = ""
-    for r in results:
-        analysis = vlm_analyze_page(r['url'], state['question'])
-        info += f"\n[來源: {r['title']}]\n{analysis}\n"
-    return {"knowledge_base": state['knowledge_base'] + info}
-
-def planner(state: AgentState):
-    print(f"🧠 [Node] 4. Planner 深度思考中...")
-    prompt = f"""
-    請評估現有資訊是否足以回答問題。
-    問題：{state['question']}
-    現有資訊：{state['knowledge_base']}
+    請判斷：
+    1. 資訊是否包含來自官方主體（相關公司/機構）的直接證據？
+    2. 如果問題涉及次數計算，是否有明確的變化歷程記錄？
+    3. 是否有足夠證據排除第三方媒體的猜測？
     
-    請以 JSON 格式回傳：
-    {{
-        "sufficient": "YES" 或 "NO",
-        "feedback": "若為 NO，請說明還缺少什麼資訊？若為 YES，請填寫 OK"
-    }}
-    """
-    res = llm.invoke(prompt).content
+    資訊是否充裕？請回答 y 或 n。"""
+    
+    res = llm.invoke([HumanMessage(content=prompt)])
+    return {"is_sufficient": 'y' in res.content.lower()}
+
+def query_gen_node(state: State):
+    print("💡 [步驟 3] 動態生成搜尋策略...")
+    # 完全根據用戶輸入動態生成搜尋詞
+    prompt = f"根據問題「{state['input_query']}」，請生成一個最能找到「官方原始公告」或「權威數據」的英文搜尋關鍵字。只需回傳關鍵字字串。"
+    res = llm.invoke([HumanMessage(content=prompt)])
+    new_kw = res.content.strip().replace('"', '')
+    print(f"📌 搜尋關鍵字：{new_kw}")
+    return {"keywords": state.get('keywords', []) + [new_kw]}
+
+def search_node(state: State):
+    print(f"📡 [步驟 4] 檢索網路資源...")
     try:
-        # 簡單解析 JSON 內容
-        data = json.loads(res[res.find("{"):res.rfind("}")+1])
-        decision = data.get("sufficient", "NO")
-        feedback = data.get("feedback", "資訊仍不足")
-    except:
-        decision = "NO"
-        feedback = "無法解析思考內容，建議擴大搜尋範圍"
+        r = requests.get(SEARXNG_URL, params={"q": state['keywords'][-1], "format": "json"}, timeout=15).json()
+        return {"search_links": r.get('results', [])[:3]}
+    except: return {"search_links": []}
 
-    print(f"🤔 決策：{decision} | 反饋：{feedback}")
-    return {"feedback": feedback, "final_answer": decision}
+def vlm_and_value_node(state: State):
+    print("📸 [步驟 5] VLM 事實提取...")
+    links = state.get('search_links', [])
+    new_info = ""
+    for link in links:
+        if link['url'] in state['visited_urls']: continue
+        print(f"📖 閱讀來源：{link['url'][:50]}...")
+        info = internal_vlm_read_website(link['url'], state['input_query'])
+        new_info += f"\n[來源: {link['url']}]\n{info}\n"
+        break 
+    return {"knowledge_base": state['knowledge_base'] + new_info, "visited_urls": [link['url']], "loop_count": state['loop_count'] + 1}
 
-def final_answer(state: AgentState):
-    print("📢 [Node] 5. 生成最終答案...")
-    prompt = f"根據以下資訊，為使用者提供完整且專業的查證報告：\n{state['knowledge_base']}\n問題：{state['question']}"
-    res = llm.invoke(prompt).content
-    return {"final_answer": res}
+def output_node(state: State):
+    if state.get("final_answer"): return state
+    print("🏁 [步驟 6] 彙整最終事實報告...")
+    prompt = f"""請針對用戶問題「{state['input_query']}」產出查證報告。
+    
+    【規則】：
+    1. **證據分級**：優先採用官方主體的直接證據，排除未經證實的傳聞。
+    2. **變化核對**：如果涉及變動次數，請列出具體的時間軸節點。
+    3. **誠實性**：若證據不足，請如實說明哪些部分屬於官方確定，哪些屬於媒體推測。
+    
+    筆記內容：
+    {state['knowledge_base']}"""
+    
+    res = llm.invoke([HumanMessage(content=prompt)])
+    final_ans = res.content
+    
+    # 快取處理
+    try:
+        if not os.path.exists(CACHE_FILE): cache = {}
+        else:
+            with open(CACHE_FILE, "r", encoding="utf-8") as f: cache = json.load(f)
+        cache[state['input_query']] = final_ans
+        with open(CACHE_FILE, "w", encoding="utf-8") as f: json.dump(cache, f, ensure_ascii=False, indent=4)
+    except: pass
+    
+    return {"final_answer": final_ans}
 
-# --- 5. 構建流程圖 ---
-workflow = StateGraph(AgentState)
+# --- 5. 構建圖表 ---
 
-# 為了讓 ASCII 呈現特定的循環樣式，按此順序添加節點
-workflow.add_node("check_cache", check_cache)
-workflow.add_node("planner", planner)
-workflow.add_node("final_answer", final_answer)
-workflow.add_node("query_gen", query_gen)
-workflow.add_node("search_tool", search_tool)
+
+
+workflow = StateGraph(State)
+workflow.add_node("check_cache", check_cache_node)
+workflow.add_node("planner", planner_node)
+workflow.add_node("query_gen", query_gen_node)
+workflow.add_node("search_tool", search_node)
+workflow.add_node("vlm_process", vlm_and_value_node)
+workflow.add_node("output", output_node)
 
 workflow.set_entry_point("check_cache")
-
-# 設定路徑
-workflow.add_conditional_edges(
-    "check_cache",
-    lambda x: "final_answer" if x["cache_hit"] else "query_gen",
-    {"final_answer": "final_answer", "query_gen": "query_gen"}
-)
-
+workflow.add_conditional_edges("check_cache", lambda x: "hit" if x.get("final_answer") else "miss", {"hit": "output", "miss": "planner"})
+workflow.add_conditional_edges("planner", lambda x: "y" if x["is_sufficient"] else "n", {"y": "output", "n": "query_gen"})
 workflow.add_edge("query_gen", "search_tool")
-workflow.add_edge("search_tool", "planner")
+workflow.add_edge("search_tool", "vlm_process")
+workflow.add_edge("vlm_process", "planner")
+workflow.add_edge("output", END)
 
-def route_logic(state: AgentState):
-    if state.get("count", 0) >= 3 or "YES" in state.get("final_answer", ""):
-        return "final_answer"
-    return "query_gen" # 帶著反饋回到生成關鍵字
-
-workflow.add_conditional_edges(
-    "planner",
-    route_logic,
-    {"final_answer": "final_answer", "query_gen": "query_gen"}
-)
-
-workflow.add_edge("final_answer", END)
 app = workflow.compile()
 
-# --- 6. 輸出圖表與執行 ---
-print("\n" + "="*20 + " 系統流程圖 " + "="*20)
-app.get_graph().print_ascii()
-print("="*55 + "\n")
-
+# --- 6. 執行介面 ---
 if __name__ == "__main__":
-    q = input("請輸入查證問題：")
-    for output in app.stream({"question": q, "knowledge_base": "", "cache_hit": False, "count": 0}):
-        for node, data in output.items():
-            if "final_answer" in data and node == "final_answer":
-                print("\n" + "✨"*10 + " 查證報告 " + "✨"*10)
-                print(data["final_answer"])
+    print("\n" + "="*50)
+    print("🕵️ 通用型自律事實查證引擎 (標的去中心化版)")
+    try: app.get_graph().print_ascii()
+    except: pass
+    print("="*50)
+
+    while True:
+        user_input = input("\n🔎 請輸入要查證的問題 (exit 退出)：").strip()
+        if not user_input or user_input.lower() == 'exit': break
+        
+        # 執行並顯示過程
+        result = app.invoke({
+            "input_query": user_input, 
+            "knowledge_base": "", 
+            "keywords": [], 
+            "loop_count": 0, 
+            "final_answer": "", 
+            "visited_urls": []
+        })
+        
+        print("\n" + "★"*25)
+        print("✨ 【 查 證 報 告 】")
+        print(result['final_answer'])
+        print(f"📊 調查深度：{result['loop_count']} 輪")
+        print("★"*25)
