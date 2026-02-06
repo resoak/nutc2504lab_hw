@@ -1,75 +1,142 @@
 import requests
+import time
 from qdrant_client import QdrantClient
-from qdrant_client.models import Distance, VectorParams, PointStruct
-
-# 1. 建立 Qdrant 連接與 Collection
-client = QdrantClient(url="http://localhost:6333")
-collection_name = "my_homework_collection"
-
-# 建立 Collection (如果已經存在會報錯，實務上可先 check 或使用 try-except)
-client.recreate_collection(
-    collection_name=collection_name,
-    vectors_config=VectorParams(size=4096, distance=Distance.COSINE),
+from qdrant_client.models import (
+    Distance, VectorParams, PointStruct, 
+    Filter, FieldCondition, MatchValue
 )
 
-# 定義一個輔助函式：使用 API 獲得向量
+# === 1. 初始化與設定 ===
+client = QdrantClient(url="http://localhost:6333")
+
+# 定義三種計算法模式
+MODES = {
+    "COSINE": {"name": "hw_cosine_final", "dist": Distance.COSINE},
+    "DOT": {"name": "hw_dot_final", "dist": Distance.DOT},
+    "EUCLID": {"name": "hw_euclid_final", "dist": Distance.EUCLID}
+}
+
+# === 2. Embedding 核心函數 (封裝成函數) ===
 def get_embeddings(texts):
+    """將模型調用封裝，動態獲取向量"""
     url = "https://ws-04.wade0426.me/embed"
-    data = {
+    payload = {
         "texts": texts,
         "normalize": True,
         "batch_size": 32
     }
-    response = requests.post(url, json=data)
-    if response.status_code == 200:
+    try:
+        response = requests.post(url, json=payload)
+        response.raise_for_status()
         return response.json()['embeddings']
-    else:
-        raise Exception(f"API Error: {response.text}")
+    except Exception as e:
+        print(f"❌ Embedding Error: {e}")
+        return []
 
-# 2. 準備五個（或更多）Point 的資料
-raw_texts = [
-    "人工智慧很有趣",
-    "機器學習是 AI 的一個分支",
-    "向量資料庫適合儲存非結構化資料",
-    "Python 是開發 AI 的熱門語言",
-    "台北今天的氣候很晴朗",
-    "大模型改變了搜尋的方式"
-]
+# === 3. 初始化 VDB (自動偵測 Size & 官方推薦新寫法) ===
+def initialize_all_vdbs():
+    """先測量維度，再根據不同計算法建立 Collection"""
+    print("🔍 正在透過 API 偵測模型向量維度...")
+    
+    # 【解決關鍵】先拿一筆資料測試維度，不把 size 寫死
+    test_vec = get_embeddings(["dimension check"])
+    if not test_vec or len(test_vec) == 0:
+        print("❌ 無法取得向量，請檢查 API 狀態。")
+        return
+    
+    dynamic_size = len(test_vec[0])
+    print(f"📏 偵測到模型維度為: {dynamic_size}\n")
 
-# 3. 使用 API 獲得向量
-print("正在取得向量...")
-vectors = get_embeddings(raw_texts)
-
-# 4. 嵌入到 VDB (Upsert points)
-print("正在將資料存入 Qdrant...")
-points = []
-for i, (text, vec) in enumerate(zip(raw_texts, vectors)):
-    points.append(
-        PointStruct(
-            id=i + 1,
-            vector=vec,
-            payload={"text": text, "source": "homework_01"}
+    for mode, info in MODES.items():
+        col_name = info["name"]
+        
+        # 修正 DeprecationWarning: 檢查是否存在 -> 刪除 -> 建立
+        if client.collection_exists(collection_name=col_name):
+            client.delete_collection(collection_name=col_name)
+            print(f"🗑️ 已清理舊的 [{mode}] 集合")
+        
+        # 建立 Collection，將偵測到的 dynamic_size 傳入
+        client.create_collection(
+            collection_name=col_name,
+            vectors_config=VectorParams(
+                size=dynamic_size, 
+                distance=info["dist"]
+            ),
         )
-    )
+        
+        # 建立分類索引 (加速分類搜尋)
+        client.create_payload_index(col_name, "category", "keyword")
+        print(f"🚀 已初始化 [{mode}] 資料庫: {col_name}")
 
-client.upsert(
-    collection_name=collection_name,
-    points=points
-)
+# === 4. 批次上傳函數 (Batch Upsert) ===
+def batch_upsert_to_all(data_list):
+    """將同一份資料同步批次上傳到三個 Collection"""
+    print(f"\n📦 正在進行批次處理 (共 {len(data_list)} 筆資料)...")
+    texts = [item["text"] for item in data_list]
+    vectors = get_embeddings(texts)
+    
+    if not vectors: return
 
-# 5. 召回內容 (搜尋)
-query_text = ["人工智慧是什麼"]
-query_vector = get_embeddings(query_text)[0]
+    for mode, info in MODES.items():
+        points = [
+            PointStruct(
+                id=int(time.time() * 1000) + i, 
+                vector=vectors[i],
+                payload={
+                    "text": data_list[i]["text"],
+                    "category": data_list[i]["category"]
+                }
+            ) for i in range(len(data_list))
+        ]
+        client.upsert(collection_name=info["name"], points=points)
+        print(f"✅ 資料已批次同步至 [{mode}] 庫")
 
-print("\n--- 搜尋結果 (召回內容) ---")
-search_result = client.query_points(
-    collection_name=collection_name,
-    query=query_vector,
-    limit=3
-)
+# === 5. 對比搜尋 (支援分類篩選) ===
+def compare_search(query_text, target_category=None):
+    """一次對比三種算法的搜尋結果，並過濾分類"""
+    print(f"\n" + "="*60)
+    print(f"🔎 搜尋對比: 「{query_text}」 | 分類過濾: {target_category or '全部'}")
+    print("="*60)
 
-for point in search_result.points:
-    print(f"ID: {point.id}")
-    print(f"相似度分數 (Score): {point.score:.4f}")
-    print(f"內容: {point.payload['text']}")
-    print("-" * 20)
+    query_vector = get_embeddings([query_text])[0]
+    
+    # 建立 Qdrant 分類篩選器
+    search_filter = None
+    if target_category:
+        search_filter = Filter(
+            must=[FieldCondition(key="category", match=MatchValue(value=target_category))]
+        )
+
+    for mode, info in MODES.items():
+        results = client.query_points(
+            collection_name=info["name"],
+            query=query_vector,
+            query_filter=search_filter,
+            limit=2
+        )
+        
+        print(f"\n🔹 模式: {mode}")
+        if not results.points:
+            print("   ⚠️ 無匹配結果")
+        for p in results.points:
+            print(f"   [Score: {p.score:8.4f}] -> {p.payload['text']} ({p.payload['category']})")
+
+# === 6. 執行主程式 ===
+if __name__ == "__main__":
+    # 步驟 1: 動態初始化 (自動抓 Size)
+    initialize_all_vdbs()
+
+    # 步驟 2: 準備大批次測試資料
+    test_data = [
+        {"text": "Python 廣泛應用於人工智慧開發", "category": "tech"},
+        {"text": "GPU 算力對於訓練大模型非常重要", "category": "tech"},
+        {"text": "今日台北氣溫偏高，午後有雨", "category": "weather"},
+        {"text": "這碗牛肉麵的湯頭濃郁，麵條Ｑ彈", "category": "food"}
+    ]
+
+    # 步驟 3: 執行同步批次上傳 (不再單點上傳)
+    batch_upsert_to_all(test_data)
+
+    # 步驟 4: 測試分類搜尋
+    compare_search("AI 與程式語言", target_category="tech")
+    compare_search("天氣預報", target_category="weather")
