@@ -11,6 +11,8 @@ from langchain_experimental.text_splitter import SemanticChunker
 API_KEY = "YOUR_API_KEY" 
 EMBED_API_URL = "https://ws-04.wade0426.me/embed"
 SUBMIT_URL = "https://hw-01.wade0426.me/submit_answer"
+CHUNK_SIZE = 300
+CHUNK_OVERLAP = 50
 
 client = QdrantClient(url="http://localhost:6333")
 
@@ -21,6 +23,7 @@ class CustomEmbeddings:
 # === 1. 功能函數 ===
 
 def get_embeddings(texts):
+    if not texts: return []
     payload = {"texts": texts, "normalize": True, "batch_size": 32}
     try:
         response = requests.post(EMBED_API_URL, json=payload)
@@ -46,6 +49,9 @@ def process_files_and_chunk():
     chunk_source_map = {}
     embeddings_tool = CustomEmbeddings()
     
+    # 針對語義切塊太長時的二次切分器
+    semantic_sub_splitter = RecursiveCharacterTextSplitter(chunk_size=CHUNK_SIZE, chunk_overlap=0)
+    
     print("\n" + "="*20 + " 1. 開始檔案切塊階段 " + "="*20)
     for file_name in data_files:
         if not os.path.exists(file_name):
@@ -56,24 +62,37 @@ def process_files_and_chunk():
         
         print(f"📄 讀取檔案: {file_name} ({len(content)} 字)")
         
-        f_chunks = [d.page_content for d in CharacterTextSplitter(chunk_size=300, chunk_overlap=0, separator="").create_documents([content])]
-        s_chunks = [d.page_content for d in RecursiveCharacterTextSplitter(chunk_size=300, chunk_overlap=50).create_documents([content])]
-        sem_chunks = [d.page_content for d in SemanticChunker(embeddings_tool).create_documents([content])]
+        # 1. 固定大小 (CharacterSplitter)
+        f_chunks = [d.page_content for d in CharacterTextSplitter(chunk_size=CHUNK_SIZE, chunk_overlap=0, separator="").create_documents([content])]
+        
+        # 2. 滑動視窗 (Recursive)
+        s_chunks = [d.page_content for d in RecursiveCharacterTextSplitter(chunk_size=CHUNK_SIZE, chunk_overlap=CHUNK_OVERLAP).create_documents([content])]
+        
+        # 3. 語義切塊 (修正後的邏輯)
+        # 先按語義切分
+        sem_base_docs = SemanticChunker(embeddings_tool, breakpoint_threshold_type="percentile").create_documents([content])
+        # 如果語義塊太大 (>300字)，再用 Recursive 切開以符合題目限制
+        sem_chunks_final = []
+        for doc in sem_base_docs:
+            if len(doc.page_content) > CHUNK_SIZE:
+                sub_docs = semantic_sub_splitter.split_text(doc.page_content)
+                sem_chunks_final.extend(sub_docs)
+            else:
+                sem_chunks_final.append(doc.page_content)
 
-        for method, chunks in [("固定大小", f_chunks), ("滑動視窗", s_chunks), ("語義切塊", sem_chunks)]:
+        for method, chunks in [("固定大小", f_chunks), ("滑動視窗", s_chunks), ("語義切塊", sem_chunks_final)]:
             all_chunks[method].extend(chunks)
-            for c in chunks: chunk_source_map[c] = file_name
+            for c in chunks: 
+                chunk_source_map[c] = file_name
         
     return all_chunks, chunk_source_map
 
-# === 3. 向量檢索與評分 (優化警告部分) ===
-
-# === 3. 向量檢索與評分 (優化並新增 Collection 名稱顯示) ===
+# === 3. 向量檢索與評分 ===
 
 def setup_vdb_and_search(all_methods_chunks, chunk_source_map):
     results_for_csv = []
     
-    # 讀取問題並一次性進行批量 Embedding
+    # 讀取問題
     questions_df = pd.read_csv("questions.csv")
     q_texts = questions_df['questions'].astype(str).tolist()
     q_ids = questions_df['q_id'].tolist()
@@ -87,10 +106,12 @@ def setup_vdb_and_search(all_methods_chunks, chunk_source_map):
         coll_name = f"hw_{uuid.uuid4().hex[:8]}"
         print(f"\n🛠️ 處理方法: [{method}] | Collection: {coll_name}")
         
-        # 🚀 批量 1: 一次性獲取所有 Chunks 的向量
+        # 批量獲取 Chunks 向量
         print(f"   ⬆️ 正在上傳 {len(chunks)} 個文本區塊...")
         chunk_vectors = get_embeddings(chunks)
         
+        if not chunk_vectors: continue
+
         if client.collection_exists(coll_name):
             client.delete_collection(coll_name)
         
@@ -105,10 +126,8 @@ def setup_vdb_and_search(all_methods_chunks, chunk_source_map):
         ]
         client.upsert(collection_name=coll_name, points=points)
 
-        # 🚀 批量 2: 檢索與評分優化
-        # 雖然評分 API 通常是單點提交，但我們可以優化檢索邏輯
+        # 檢索與評分
         for i, q_vec in enumerate(all_q_vectors):
-            # 這裡可以使用 Qdrant 的 batch 搜尋 API，但為了維持 logic 清晰，我們批量處理變數
             search_res = client.query_points(
                 collection_name=coll_name, 
                 query=q_vec, 
@@ -116,11 +135,9 @@ def setup_vdb_and_search(all_methods_chunks, chunk_source_map):
             ).points
             
             retrieved_text = search_res[0].payload['text'] if search_res else ""
-            
-            # 提交評分 (此處若 API 支援 Batch 提交會更快)
             score = submit_and_get_score(q_ids[i], retrieved_text)
             
-            if i % 5 == 0: # 減少 log 刷屏，每 5 題印一次
+            if i % 10 == 0:
                 print(f"   📝 已處理 Q{q_ids[i]} | Score: {score:.4f}")
             
             results_for_csv.append({
@@ -130,9 +147,6 @@ def setup_vdb_and_search(all_methods_chunks, chunk_source_map):
                 "score": score,
                 "source": chunk_source_map.get(retrieved_text, "unknown")
             })
-        
-        # 選項：清理 Collection 節省記憶體
-        # client.delete_collection(coll_name)
             
     return results_for_csv
 
@@ -143,21 +157,14 @@ if __name__ == "__main__":
     final_results = setup_vdb_and_search(all_chunks, source_map)
     
     df_output = pd.DataFrame(final_results)
+    # 生成 8 位隨機 ID 作為每筆結果的唯一識別碼
     df_output.insert(0, 'id', [uuid.uuid4().hex[:8] for _ in range(len(df_output))])
     
     output_name = "1111232019_RAG_HW_01.csv"
     df_output.to_csv(output_name, index=False, encoding="utf-8-sig")
     
-    print("\n" + "="*30 + " 3. 最終 CSV 執行結果 (60 筆) " + "="*30)
-    pd.set_option('display.max_columns', None)
-    pd.set_option('display.width', 1000)
-    pd.set_option('display.max_rows', 60)
-    # 打印前 60 筆的重要欄位供快速檢查
-    print(df_output[['id', 'q_id', 'method', 'score', 'source']])
-    
-    print("\n" + "="*60)
+    print("\n" + "="*30 + " 3. 執行統計 " + "="*30)
     avg_scores = df_output.groupby('method')['score'].mean()
-    print("💡 各切塊方法平均分數統計：")
     for m, s in avg_scores.items():
-        print(f"   🔹 {m}: {s:.4f}")
-    print("="*60)
+        print(f"   🔹 {m} 平均分: {s:.4f} | 區塊數: {len(all_chunks[m])}")
+    print(f"\n✅ 結果已儲存至: {output_name}")
