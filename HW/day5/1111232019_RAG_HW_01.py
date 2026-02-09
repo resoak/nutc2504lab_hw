@@ -24,9 +24,10 @@ class CustomEmbeddings:
 
 def get_embeddings(texts):
     if not texts: return []
+    # 增加 timeout 與批量處理
     payload = {"texts": texts, "normalize": True, "batch_size": 32}
     try:
-        response = requests.post(EMBED_API_URL, json=payload)
+        response = requests.post(EMBED_API_URL, json=payload, timeout=60)
         response.raise_for_status()
         return response.json()['embeddings']
     except Exception as e:
@@ -36,12 +37,12 @@ def get_embeddings(texts):
 def submit_and_get_score(q_id, answer):
     payload = {"q_id": q_id, "student_answer": answer}
     try:
-        response = requests.post(SUBMIT_URL, json=payload)
+        response = requests.post(SUBMIT_URL, json=payload, timeout=20)
         return response.json().get("score", 0) if response.status_code == 200 else 0
     except:
         return 0
 
-# === 2. 檔案處理與三種切塊 ===
+# === 2. 檔案處理與切塊 (維持原邏輯) ===
 
 def process_files_and_chunk():
     data_files = [f"data_0{i}.txt" for i in range(1, 6)]
@@ -49,29 +50,25 @@ def process_files_and_chunk():
     chunk_source_map = {}
     embeddings_tool = CustomEmbeddings()
     
-    # 針對語義切塊太長時的二次切分器
     semantic_sub_splitter = RecursiveCharacterTextSplitter(chunk_size=CHUNK_SIZE, chunk_overlap=0)
     
     print("\n" + "="*20 + " 1. 開始檔案切塊階段 " + "="*20)
     for file_name in data_files:
         if not os.path.exists(file_name):
-            print(f"⚠️ 跳過不存在的檔案: {file_name}")
             continue
         with open(file_name, "r", encoding="utf-8") as f:
             content = f.read()
         
         print(f"📄 讀取檔案: {file_name} ({len(content)} 字)")
         
-        # 1. 固定大小 (CharacterSplitter)
+        # 1. 固定大小
         f_chunks = [d.page_content for d in CharacterTextSplitter(chunk_size=CHUNK_SIZE, chunk_overlap=0, separator="").create_documents([content])]
         
-        # 2. 滑動視窗 (Recursive)
+        # 2. 滑動視窗
         s_chunks = [d.page_content for d in RecursiveCharacterTextSplitter(chunk_size=CHUNK_SIZE, chunk_overlap=CHUNK_OVERLAP).create_documents([content])]
         
-        # 3. 語義切塊 (修正後的邏輯)
-        # 先按語義切分
+        # 3. 語義切塊
         sem_base_docs = SemanticChunker(embeddings_tool, breakpoint_threshold_type="percentile").create_documents([content])
-        # 如果語義塊太大 (>300字)，再用 Recursive 切開以符合題目限制
         sem_chunks_final = []
         for doc in sem_base_docs:
             if len(doc.page_content) > CHUNK_SIZE:
@@ -87,43 +84,49 @@ def process_files_and_chunk():
         
     return all_chunks, chunk_source_map
 
-# === 3. 向量檢索與評分 ===
+# === 3. 向量庫操作與檢索評分 ===
 
 def setup_vdb_and_search(all_methods_chunks, chunk_source_map):
     results_for_csv = []
-    
-    # 讀取問題
     questions_df = pd.read_csv("questions.csv")
     q_texts = questions_df['questions'].astype(str).tolist()
     q_ids = questions_df['q_id'].tolist()
     
-    print(f"\n📡 正在批量獲取 {len(q_texts)} 個問題的向量...")
+    # 固定名稱映射
+    method_to_coll = {
+        "固定大小": "coll_fixed_size",
+        "滑動視窗": "coll_sliding_window",
+        "語義切塊": "coll_semantic_chunk"
+    }
+    
+    print(f"\n📡 正在獲取 {len(q_texts)} 個問題的向量...")
     all_q_vectors = get_embeddings(q_texts)
     
     print("\n" + "="*20 + " 2. 開始批量向量檢索與評分 " + "="*20)
 
     for method, chunks in all_methods_chunks.items():
-        coll_name = f"hw_{uuid.uuid4().hex[:8]}"
-        print(f"\n🛠️ 處理方法: [{method}] | Collection: {coll_name}")
+        coll_name = method_to_coll[method]
+        print(f"\n🛠️ 處理方法: [{method}] | 固定 Collection: {coll_name}")
         
-        # 批量獲取 Chunks 向量
-        print(f"   ⬆️ 正在上傳 {len(chunks)} 個文本區塊...")
         chunk_vectors = get_embeddings(chunks)
-        
         if not chunk_vectors: continue
 
-        if client.collection_exists(coll_name):
-            client.delete_collection(coll_name)
+        # --- 修改點：不刪除，僅檢查是否存在 ---
+        if not client.collection_exists(coll_name):
+            print(f"✨ 建立新的 Collection: {coll_name}")
+            client.create_collection(
+                collection_name=coll_name,
+                vectors_config=VectorParams(size=len(chunk_vectors[0]), distance=Distance.COSINE)
+            )
+        else:
+            print(f"📦 使用現有的 Collection: {coll_name} (直接寫入新 Points)")
         
-        client.create_collection(
-            collection_name=coll_name,
-            vectors_config=VectorParams(size=len(chunk_vectors[0]), distance=Distance.COSINE)
-        )
-        
+        # Point ID 依然使用 UUID 以免重複
         points = [
-            PointStruct(id=i, vector=chunk_vectors[i], payload={"text": chunks[i]}) 
+            PointStruct(id=uuid.uuid4().hex, vector=chunk_vectors[i], payload={"text": chunks[i]}) 
             for i in range(len(chunks))
         ]
+        # 直接 Upsert 資料
         client.upsert(collection_name=coll_name, points=points)
 
         # 檢索與評分
@@ -157,7 +160,7 @@ if __name__ == "__main__":
     final_results = setup_vdb_and_search(all_chunks, source_map)
     
     df_output = pd.DataFrame(final_results)
-    # 生成 8 位隨機 ID 作為每筆結果的唯一識別碼
+    # 生成結果識別 ID
     df_output.insert(0, 'id', [uuid.uuid4().hex[:8] for _ in range(len(df_output))])
     
     output_name = "1111232019_RAG_HW_01.csv"
@@ -166,5 +169,5 @@ if __name__ == "__main__":
     print("\n" + "="*30 + " 3. 執行統計 " + "="*30)
     avg_scores = df_output.groupby('method')['score'].mean()
     for m, s in avg_scores.items():
-        print(f"   🔹 {m} 平均分: {s:.4f} | 區塊數: {len(all_chunks[m])}")
+        print(f"   🔹 {m} 平均分: {s:.4f}")
     print(f"\n✅ 結果已儲存至: {output_name}")
