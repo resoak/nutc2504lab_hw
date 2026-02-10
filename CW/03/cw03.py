@@ -2,173 +2,171 @@ import os
 import glob
 import pandas as pd
 import uuid
+import requests
+import sys
 import time
-from typing import List, Dict
+from typing import List
 
-# LangChain 相關組件
+# LangChain 與模型相關組件
 from langchain_openai import ChatOpenAI
 from langchain_text_splitters import RecursiveCharacterTextSplitter
-import requests
-
-# Qdrant 相關組件
 from qdrant_client import QdrantClient, models
 
 # === 1. 配置與初始化 ===
-VLM_BASE_URL = "https://ws-05.huannago.com/v1"
+VLM_BASE_URL = "https://ws-02.wade0426.me/v1"
 VLM_MODEL = "google/gemma-3-27b-it"
 EMBED_URL = "https://ws-04.wade0426.me/embed"
 COLLECTION_NAME = "gemma_multi_turn_rag"
 
-# 初始化 LLM (Gemma-3-27b-it)
+# 請確保 API Key 正確
 llm = ChatOpenAI(
     base_url=VLM_BASE_URL,
-    api_key="YOUR_API_KEY", # ⚠️ 請在此處填入您的 API Key
+    api_key="YOUR_API_KEY", 
     model=VLM_MODEL,
     temperature=0,
-    timeout=120
+    timeout=60 
 )
 
-# 連線至本地 Qdrant (Dashboard: http://localhost:6333)
 client = QdrantClient(url="http://localhost:6333")
 
-# === 2. 向量化工具函數 ===
-def get_embeddings(texts: List[str]) -> List[List[float]]:
+# === 2. 高速向量化工具函數 (支援批次處理與重試) ===
+def get_embeddings_batch(texts: List[str]) -> List[List[float]]:
+    if not texts: return []
     payload = {"texts": texts, "normalize": True, "task_description": "檢索技術與生活文件"}
-    try:
-        response = requests.post(EMBED_URL, json=payload, timeout=60)
-        return response.json()["embeddings"]
-    except Exception as e:
-        print(f"❌ Embedding 失敗: {e}")
-        return []
+    for attempt in range(3):
+        try:
+            response = requests.post(EMBED_URL, json=payload, timeout=60)
+            response.raise_for_status()
+            return response.json().get("embeddings", [])
+        except Exception as e:
+            print(f"  ⚠️ Embedding 嘗試 {attempt+1} 失敗: {e}")
+            time.sleep(2)
+    return []
 
-# === 3. 初始化知識庫 ===
+# === 3. 初始化知識庫 (高速版) ===
 def initialize_db():
     print("\n" + "="*50)
-    print("📡 [步驟 1/2] 正在初始化本地 Qdrant 知識庫...")
-    print("="*50)
+    print("📡 [步驟 1/2] 正在高速初始化知識庫...")
     
-    sample_vec = get_embeddings(["check"])[0]
-    dim = len(sample_vec)
-    
-    if client.collection_exists(COLLECTION_NAME):
-        print(f"🗑️  偵測到舊集合，正在刪除並重建: {COLLECTION_NAME}")
-        client.delete_collection(COLLECTION_NAME)
-    
-    client.create_collection(
+    sample = get_embeddings_batch(["check"])
+    if not sample:
+        print("🛑 向量伺服器連線失敗，程式停止。")
+        sys.exit(1)
+        
+    dim = len(sample[0])
+    # 快速重置 Collection
+    client.recreate_collection(
         collection_name=COLLECTION_NAME,
         vectors_config=models.VectorParams(size=dim, distance=models.Distance.COSINE)
     )
     
     file_paths = glob.glob("data_0*.txt")
-    splitter = RecursiveCharacterTextSplitter(chunk_size=350, chunk_overlap=50)
-    all_points = []
+    splitter = RecursiveCharacterTextSplitter(chunk_size=400, chunk_overlap=50)
     
     for path in file_paths:
         file_name = os.path.basename(path)
-        print(f"📖 正在讀取並切分檔案: {file_name}")
-        with open(path, 'r', encoding='utf-8') as f:
-            chunks = splitter.split_text(f.read())
-            vectors = get_embeddings(chunks)
-            for chunk, vec in zip(chunks, vectors):
-                all_points.append(models.PointStruct(
-                    id=str(uuid.uuid4()),
-                    vector=vec,
-                    payload={"text": chunk, "source": file_name}
-                ))
-    
-    client.upsert(collection_name=COLLECTION_NAME, points=all_points)
-    print(f"✅ 知識庫匯入完成，共計 {len(all_points)} 個資料點。")
+        print(f"📖 處理檔案: {file_name}...", end="", flush=True)
+        with open(path, 'r', encoding='utf-8-sig', errors='replace') as f:
+            content = f.read().replace('\ufffd', '')
+            chunks = splitter.split_text(content)
+            vectors = get_embeddings_batch(chunks)
+            if vectors:
+                points = [models.PointStruct(
+                    id=str(uuid.uuid4()), 
+                    vector=v, 
+                    payload={"text": c, "source": file_name}
+                ) for c, v in zip(chunks, vectors)]
+                client.upsert(collection_name=COLLECTION_NAME, points=points)
+                print(f" ✅ ({len(chunks)} 區塊)")
+            else:
+                print(" ❌ 向量化失敗")
 
-# === 4. 執行多輪 RAG 任務 (全過程 Print) ===
+# === 4. 執行 RAG 任務 (修正型別衝突與 502 錯誤) ===
 def run_rag_task():
+    print("\n" + "="*50)
     input_file = "Re_Write_questions.csv" 
-    if not os.path.exists(input_file):
-        print(f"❌ 找不到來源檔案: {input_file}")
+    prompt_file = "Prompt_ReWrite.txt"
+    output_file = "Re_Write_questions_result.csv"
+
+    if not os.path.exists(input_file) or not os.path.exists(prompt_file):
+        print("❌ 錯誤：找不到必要檔案。")
         return
-    
-    df = pd.read_csv(input_file)
+
+    with open(prompt_file, "r", encoding="utf-8") as f:
+        rewrite_instruction = f.read()
+
+    # 讀取 CSV
+    df = pd.read_csv(input_file, encoding='utf-8-sig')
     df.columns = df.columns.str.strip()
     
-    if os.path.exists("Prompt_ReWrite.txt"):
-        with open("Prompt_ReWrite.txt", "r", encoding="utf-8") as f:
-            rewrite_instruction = f.read()
-    else:
-        rewrite_instruction = "你是一個查詢重寫專家。請根據對話歷史將最新問題改寫為獨立的搜尋語句。"
+    # --- 關鍵修正：預先強制轉換型別為字串物件，避免 LossySetitemError ---
+    df['answer'] = ""
+    df['answer'] = df['answer'].astype(object)
+    df['source'] = ""
+    df['source'] = df['source'].astype(object)
+    # -------------------------------------------------------------
 
     session_history = {} 
-    final_answers = []
-    final_sources = []
-
-    print("\n" + "="*50)
-    print(f"🚀 [步驟 2/2] 開始處理問題集: {input_file}")
-    print("="*50)
+    print(f"🚀 [步驟 2/2] 開始處理問題集 (共 {len(df)} 題)...")
 
     for index, row in df.iterrows():
         cid = str(row['conversation_id'])
         original_q = str(row['questions']) 
-        history_str = session_history.get(cid, "無對話歷史")
+        history = session_history.get(cid, "")
 
-        print(f"\n👉 [第 {index+1} 題] 會話 ID: {cid}")
-        print(f"   [原始問題]: {original_q}")
+        print(f"\n--- [正在處理第 {index+1} 題] (CID: {cid}) ---")
 
-        # Step 1: Query Rewrite
-        print(f"   [正在改寫查詢中...]")
-        rewrite_prompt = f"{rewrite_instruction}\n\n[對話歷史]:\n{history_str}\n\n[最新問題]:\n{original_q}\n\n請直接輸出重寫後的搜尋語句："
-        try:
-            rewritten_q = llm.invoke(rewrite_prompt).content.strip()
-            print(f"   [改寫結果]: {rewritten_q}")
-        except Exception as e:
-            print(f"   ⚠️ 改寫失敗 ({e})，使用原句搜尋。")
-            rewritten_q = original_q
+        # A. 問題改寫 (含簡單重試)
+        rewritten_q = original_q
+        for _ in range(2):
+            try:
+                rewrite_prompt = f"{rewrite_instruction}\n\n[歷史]:\n{history}\n\n[問題]:\n{original_q}\n\n搜尋句："
+                rewritten_q = llm.invoke(rewrite_prompt).content.strip()
+                print(f"🔍 搜尋句: {rewritten_q}")
+                break
+            except: time.sleep(2)
 
-        # Step 2: Retrieval
-        print(f"   [正在檢索向量資料庫...]")
-        q_vec = get_embeddings([rewritten_q])[0]
-        search_results = client.query_points(
-            collection_name=COLLECTION_NAME,
-            query=q_vec,
-            limit=5
-        ).points
-        
-        context_list = [hit.payload['text'] for hit in search_results]
-        context_str = "\n".join(context_list)
-        top_source = search_results[0].payload['source'] if search_results else "未知來源"
-        
-        print(f"   [檢索到來源]: {top_source}")
-        # print(f"   [參考片段]: {context_list[0][:50]}...") # 若想看更細可解鎖這行
+        # B. 檢索
+        q_vec_list = get_embeddings_batch([rewritten_q])
+        context, top_source = "", "未知"
+        if q_vec_list:
+            q_vec = q_vec_list[0]
+            hits = client.query_points(collection_name=COLLECTION_NAME, query=q_vec, limit=3).points
+            context = "\n".join([h.payload['text'] for h in hits])
+            top_source = hits[0].payload['source'] if hits else "未知來源"
+            for i, hit in enumerate(hits):
+                print(f"  📍 匹配項 {i+1}: {hit.payload['text'][:30]}...")
 
-        # Step 3: Generation
-        print(f"   [正在生成最終回答...]")
-        final_prompt = f"""請嚴格根據參考資訊回答。資訊不足請回「抱歉，我無法回答」。
-【參考資訊】：
-{context_str}
-【問題】：{rewritten_q}
-回答："""
+        # C. 回答生成 (處理 502 Bad Gateway)
+        final_prompt = (
+            f"你是一個助手，請根據資訊回答問題。請使用正確的繁體中文，避免錯字。\n"
+            f"若資訊中出現編碼偏移（如『虨擬』、『斧理器』），請自動修正為正確名詞（如『虛擬』、『處理器』）。\n\n"
+            f"【資訊】：\n{context}\n\n"
+            f"【問題】：{rewritten_q}\n回答："
+        )
         
-        try:
-            answer = llm.invoke(final_prompt).content.strip()
-            print(f"   [機器回答]: {answer[:50]}...")
-        except Exception as e:
-            answer = "抱歉，系統生成回答時出錯。"
-            print(f"   ❌ 回答生成失敗: {e}")
-        
-        # 更新歷史
-        session_history[cid] = history_str + f"\n問：{original_q}\n答：{answer}\n"
-        
-        final_answers.append(answer)
-        final_sources.append(top_source)
-        time.sleep(0.5)
+        answer = "伺服器暫時連線失敗，請檢查後端狀態。"
+        for attempt in range(3):
+            try:
+                answer_content = llm.invoke(final_prompt).content.strip().replace('\ufffd', '')
+                answer = answer_content
+                print(f"✨ AI 回答成功")
+                break
+            except Exception as e:
+                print(f"  ⚠️ 生成失敗 (嘗試 {attempt+1})，原因: {e}")
+                time.sleep(7) # 遇到 502/504 時，讓伺服器喘息一下
 
-    # 儲存結果
-    df['answer'] = final_answers
-    df['source'] = final_sources
-    
-    output_csv = "Re_Write_questions_result.csv"
-    df.to_csv(output_csv, index=False, encoding="utf-8-sig")
-    print("\n" + "="*50)
-    print(f"🎉 任務圓滿完成！")
-    print(f"💾 結果檔案已儲存至: {output_csv}")
-    print("="*50)
+        # 填入結果
+        df.at[index, 'answer'] = answer
+        df.at[index, 'source'] = top_source
+        
+        # 更新對話歷史
+        session_history[cid] = history + f"問：{original_q}\n答：{answer}\n"
+
+    # 輸出最終結果
+    df.to_csv(output_file, index=False, encoding="utf-8-sig")
+    print(f"\n" + "="*50)
+    print(f"🎉 任務處理完畢！結果儲存至: {output_file}")
 
 if __name__ == "__main__":
     initialize_db()

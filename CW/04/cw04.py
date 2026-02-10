@@ -16,7 +16,7 @@ from qdrant_client import QdrantClient, models
 from transformers import AutoTokenizer, AutoModelForCausalLM
 
 # === 1. 配置與初始化 ===
-VLM_BASE_URL = "https://ws-05.huannago.com/v1"
+VLM_BASE_URL = "https://ws-02.wade0426.me/v1"
 VLM_MODEL = "google/gemma-3-27b-it"
 EMBED_URL = "https://ws-04.wade0426.me/embed"
 COLLECTION_NAME = "gemma_hybrid_qwen3_rerank"
@@ -30,7 +30,7 @@ llm = ChatOpenAI(
 )
 
 # === 2. 載入本地 Qwen3 Reranker (CausalLM 版) ===
-model_path = os.path.expanduser("~/AI/Models/Qwen3-Reranker-0.6B")
+model_path = os.path.expanduser("C:\\Users\\RS\Downloads\\Qwen3-Reranker-0.6B")
 print(f"📦 正在載入 CausalLM Reranker: {model_path}")
 
 reranker_tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)

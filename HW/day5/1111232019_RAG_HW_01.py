@@ -48,11 +48,9 @@ def submit_and_get_score(q_id, answer):
 
 def process_files_and_chunk():
     data_files = [f"data_0{i}.txt" for i in range(1, 6)]
-    # 這裡改成儲存 dict，包含 text 與 source
     all_chunks_data = {"固定大小": [], "滑動視窗": [], "語義切塊": []}
     embeddings_tool = CustomEmbeddings()
     
-    # 二次切分器 (當語義塊過大時)
     semantic_sub_splitter = RecursiveCharacterTextSplitter(chunk_size=CHUNK_SIZE, chunk_overlap=0)
     
     print("\n" + "="*20 + " 1. 開始檔案切塊階段 " + "="*20)
@@ -92,9 +90,9 @@ def process_files_and_chunk():
         
     return all_chunks_data
 
-# === 3. 向量檢索與評分 ===
+# === 3. 向量檢索與評分 (修改後：檢查資料庫是否存在) ===
 
-def setup_vdb_and_search(all_chunks_data):
+def setup_vdb_and_search():
     results_for_csv = []
     
     # 讀取問題
@@ -111,35 +109,51 @@ def setup_vdb_and_search(all_chunks_data):
     print(f"\n📡 正在批量獲取 {len(q_texts)} 個問題的向量...")
     all_q_vectors = get_embeddings(q_texts)
     
-    print("\n" + "="*20 + " 2. 開始批量向量檢索與評分 " + "="*20)
+    # 延遲切塊：只有在必要時才呼叫切塊函數
+    all_chunks_data = None 
 
-    for method, chunk_items in all_chunks_data.items():
-        coll_name = method_to_coll[method]
-        print(f"\n🛠️ 處理方法: [{method}]")
-        
-        texts = [item['text'] for item in chunk_items]
-        sources = [item['source'] for item in chunk_items]
-        
-        chunk_vectors = get_embeddings(texts)
-        if not chunk_vectors: continue
+    print("\n" + "="*20 + " 2. 向量檢索與評分階段 " + "="*20)
 
-        # 重建 Collection (確保資料乾淨)
-        client.recreate_collection(
-            collection_name=coll_name,
-            vectors_config=VectorParams(size=len(chunk_vectors[0]), distance=Distance.COSINE)
-        )
+    for method, coll_name in method_to_coll.items():
+        print(f"\n🛠️ 正在確認方法: [{method}]")
         
-        # 將 text 與 source 一起存入 payload
-        points = [
-            PointStruct(
-                id=uuid.uuid4().hex, 
-                vector=chunk_vectors[i], 
-                payload={"text": texts[i], "source": sources[i]}
-            ) for i in range(len(texts))
-        ]
-        client.upsert(collection_name=coll_name, points=points)
+        # --- 修改處：檢查 Collection 是否存在 ---
+        if not client.collection_exists(collection_name=coll_name):
+            print(f"ℹ️ {coll_name} 不存在，開始初始化資料...")
+            
+            # 只有第一次需要時才執行切塊
+            if all_chunks_data is None:
+                all_chunks_data = process_files_and_chunk()
+            
+            chunk_items = all_chunks_data[method]
+            texts = [item['text'] for item in chunk_items]
+            sources = [item['source'] for item in chunk_items]
+            
+            chunk_vectors = get_embeddings(texts)
+            if not chunk_vectors:
+                print(f"⚠️ 無法取得向量，跳過方法: {method}")
+                continue
 
-        # 檢索與評分
+            # 建立 Collection
+            client.create_collection(
+                collection_name=coll_name,
+                vectors_config=VectorParams(size=len(chunk_vectors[0]), distance=Distance.COSINE)
+            )
+            
+            # 存入資料
+            points = [
+                PointStruct(
+                    id=uuid.uuid4().hex, 
+                    vector=chunk_vectors[i], 
+                    payload={"text": texts[i], "source": sources[i]}
+                ) for i in range(len(texts))
+            ]
+            client.upsert(collection_name=coll_name, points=points)
+            print(f"✅ {coll_name} 資料初始化完成。")
+        else:
+            print(f"✅ {coll_name} 已存在，跳過上傳步驟。")
+
+        # --- 執行檢索與評分 (無論是否為新建立都會執行) ---
         for i, q_vec in enumerate(all_q_vectors):
             search_res = client.query_points(
                 collection_name=coll_name, 
@@ -147,16 +161,14 @@ def setup_vdb_and_search(all_chunks_data):
                 limit=3
             ).points
             
-            # 整合內容與來源
             retrieved_content = "\n".join([h.payload['text'] for h in search_res])
-            # 取得不重複的來源檔案
             unique_sources = list(set([h.payload['source'] for h in search_res]))
             source_str = ",".join(unique_sources)
             
             score = submit_and_get_score(q_ids[i], retrieved_content)
             
             if i % 20 == 0:
-                print(f"   📝 Q{q_ids[i]} | Score: {score:.4f} | Source: {source_str}")
+                print(f"   📝 Q{q_ids[i]} | Score: {score:.4f} | Method: {method}")
             
             results_for_csv.append({
                 "q_id": q_ids[i],
@@ -173,24 +185,21 @@ def setup_vdb_and_search(all_chunks_data):
 if __name__ == "__main__":
     start_time = time.time()
     
-    # 1. 執行切塊 (回傳帶有 metadata 的資料)
-    all_chunks_data = process_files_and_chunk()
+    # 修改：直接進入資料庫處理流程，內含切塊邏輯
+    final_results = setup_vdb_and_search()
     
-    # 2. 執行向量化與評測
-    final_results = setup_vdb_and_search(all_chunks_data)
-    
-    # 3. 輸出 CSV
+    # 輸出 CSV
     df_output = pd.DataFrame(final_results)
-    # 生成短 ID 作為每筆紀錄的識別碼
     df_output.insert(0, 'id', [uuid.uuid4().hex[:8] for _ in range(len(df_output))])
     
     output_name = "1111232019_RAG_HW_01.csv"
     df_output.to_csv(output_name, index=False, encoding="utf-8-sig")
     
     print("\n" + "="*30 + " 3. 執行統計 " + "="*30)
-    avg_scores = df_output.groupby('method')['score'].mean()
-    for m, s in avg_scores.items():
-        print(f"   🔹 {m} 平均分: {s:.4f} | 總區塊數: {len(all_chunks_data[m])}")
+    if not df_output.empty:
+        avg_scores = df_output.groupby('method')['score'].mean()
+        for m, s in avg_scores.items():
+            print(f"   🔹 {m} 平均分: {s:.4f}")
     
     print(f"\n✅ 全部完成！總耗時: {time.time() - start_time:.2f} 秒")
     print(f"✅ 結果已儲存至: {output_name}")
