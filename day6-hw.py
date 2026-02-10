@@ -1,107 +1,180 @@
-import os
 import pandas as pd
 import requests
-from typing import List
-from concurrent.futures import ThreadPoolExecutor
-from openai import OpenAI
-from sentence_transformers import CrossEncoder
-from langchain_text_splitters import RecursiveCharacterTextSplitter
-from qdrant_client import QdrantClient, models
-from rank_bm25 import BM25Okapi
+import json
+import time
+import re
+import os
 from deepeval.metrics import (
-    FaithfulnessMetric, AnswerRelevancyMetric, 
-    ContextualRecallMetric, ContextualPrecisionMetric, ContextualRelevancyMetric
+    FaithfulnessMetric, 
+    AnswerRelevancyMetric, 
+    ContextualRecallMetric, 
+    ContextualPrecisionMetric, 
+    ContextualRelevancyMetric
 )
 from deepeval.test_case import LLMTestCase
-from deepeval.models import DeepEvalBaseLLM
+from deepeval.models.base_model import DeepEvalBaseLLM
 
-# === 基礎組件 ===
-EMBED_URL = "https://ws-04.wade0426.me/embed"
-COLLECTION_NAME = "day6_hw_final_run"
-LOCAL_RERANKER_PATH = r"C:\Users\RS\Downloads\Qwen3-Reranker-0.6B"
+# --- 1. 配置與自定義模型 (強化 JSON 擷取穩定性) ---
+API_URL = "https://ws-01.wade0426.me/v1/chat/completions"
+MODEL_NAME = "allenai/olmOCR-2-7B-1025-FP8"
 
-class FastLLM(DeepEvalBaseLLM):
-    def __init__(self):
-        self.client = OpenAI(api_key="No", base_url="https://ws-02.wade0426.me/v1")
-    def load_model(self): return self.client
+class CustomEvalModel(DeepEvalBaseLLM):
+    def __init__(self, model_name):
+        self.model_name = model_name
+    def load_model(self):
+        return self.model_name
     def generate(self, prompt: str) -> str:
-        res = self.client.chat.completions.create(model="google/gemma-3-27b-it", messages=[{"role": "user", "content": prompt}], temperature=0)
-        return res.choices[0].message.content
-    async def a_generate(self, prompt: str) -> str: return self.generate(prompt)
-    def get_model_name(self): return "Gemma-3"
+        payload = {
+            "model": self.model_name,
+            "messages": [
+                {"role": "system", "content": "You are an evaluation judge. Respond ONLY with a JSON object. No prose."},
+                {"role": "user", "content": prompt}
+            ],
+            "temperature": 0
+        }
+        try:
+            response = requests.post(API_URL, json=payload, timeout=120)
+            raw = response.json()['choices'][0]['message']['content']
+            # 使用 Regex 強制擷取 JSON 區塊
+            match = re.search(r'(\{.*\})', raw, re.DOTALL)
+            return match.group(1) if match else raw
+        except:
+            return "{}"
+    async def a_generate(self, prompt: str) -> str:
+        return self.generate(prompt)
+    def get_model_name(self):
+        return self.model_name
 
-custom_llm = FastLLM()
-q_client = QdrantClient(url="http://localhost:6333")
-rerank_model = CrossEncoder(LOCAL_RERANKER_PATH, device="cuda", trust_remote_code=True)
+# --- 2. RAG 技術模組 (強化檢索召回率) ---
 
-def get_embeddings(texts: List[str]):
-    return requests.post(EMBED_URL, json={"texts": texts, "normalize": True}).json()["embeddings"]
+def llm_chat(prompt, system="你是一個專業的台水客服助手"):
+    payload = {
+        "model": MODEL_NAME, 
+        "messages": [{"role": "system", "content": system}, {"role": "user", "content": prompt}], 
+        "temperature": 0.1
+    }
+    try:
+        res = requests.post(API_URL, json=payload, timeout=60)
+        return res.json()['choices'][0]['message']['content']
+    except:
+        return "無法生成答案"
 
-def advanced_search(query, bm25, all_chunks, top_k=5):
-    q_vec = get_embeddings([query])[0]
-    search_res = q_client.query_points(collection_name=COLLECTION_NAME, query=q_vec, limit=20).points
-    bm25_scores = bm25.get_scores(query.split())
-    top_bm25_idx = pd.Series(bm25_scores).nlargest(10).index
-    candidates = list(set([h.payload["page_content"] for h in search_res] + [all_chunks[idx] for idx in top_bm25_idx]))
-    pairs = [[query, cand] for cand in candidates]
-    scores = rerank_model.predict(pairs, batch_size=1)
-    ranked = sorted(zip(candidates, scores), key=lambda x: x[1], reverse=True)
-    return [c for c, s in ranked[:top_k]]
+def query_rewrite(q):
+    """技術 1: Query Rewrite - 修正口語，產出核心關鍵字"""
+    prompt = f"請將用戶問題改寫為 2-3 個適合搜尋的關鍵字（例如：簡訊帳單 申請 流程）：\n問題：{q}\n只需要回傳關鍵字，用空格隔開。"
+    return llm_chat(prompt, "你負責優化搜尋關鍵字")
 
-# 評估單一題目
-def process_task(row, golden, bm25, all_chunks):
-    qid, q_text = row['q_id'], row['questions']
-    print(f"🚀 [Q{qid}] 啟動檢索生成...", flush=True)
-    
-    contexts = advanced_search(q_text, bm25, all_chunks)
-    answer = custom_llm.generate(f"資訊：\n{''.join(contexts)}\n問題：{q_text}\n回答：")
-    
-    test_case = LLMTestCase(input=q_text, actual_output=answer, retrieval_context=contexts, expected_output=golden)
-    
-    # 關閉 async_mode=False 以便即時顯示 print
-    metrics = [
-        FaithfulnessMetric(model=custom_llm, async_mode=False),
-        AnswerRelevancyMetric(model=custom_llm, async_mode=False),
-        ContextualRecallMetric(model=custom_llm, async_mode=False),
-        ContextualPrecisionMetric(model=custom_llm, async_mode=False),
-        ContextualRelevancyMetric(model=custom_llm, async_mode=False)
-    ]
-    
-    res = {"q_id": qid, "questions": q_text, "answer": answer}
-    for m in metrics:
-        m.measure(test_case)
-        res[m.__class__.__name__] = m.score
-    
-    print(f"✅ [Q{qid}] 評估完畢 (Faithfulness: {res['FaithfulnessMetric']})", flush=True)
-    return res
+def hybrid_search(keywords, path='qa_data.txt'):
+    """技術 2: Hybrid Search - 強化關鍵字匹配邏輯"""
+    try:
+        with open(path, 'r', encoding='utf-8') as f:
+            corpus = f.readlines()
+        
+        word_list = keywords.split()
+        results = []
+        for line in corpus:
+            line = line.strip()
+            # 只要包含任何一個關鍵字就計分，分數越高排越前面
+            score = sum(1 for word in word_list if word in line)
+            if score > 0:
+                results.append((score, line))
+        
+        # 按匹配程度排序
+        results.sort(key=lambda x: x[0], reverse=True)
+        return [r[1] for r in results[:3]] if results else ["目前資料庫無相關內容"]
+    except:
+        return ["讀取資料庫失敗"]
+
+def rerank(q, ctx):
+    """技術 3: Rerank - 從候選清單選出最精確的一段"""
+    if len(ctx) <= 1 or ctx[0] == "目前資料庫無相關內容": return ctx
+    prompt = f"問題：{q}\n搜尋結果：\n{ctx}\n請從中選出最能回答問題的『一段』原始文字回傳，不可修改內容。"
+    return [llm_chat(prompt, "你是一個精準的重排篩選器")]
+
+# --- 3. 執行邏輯 ---
 
 def main():
-    # 準備資料
-    with open("qa_data.txt", "r", encoding="utf-8") as f:
-        all_chunks = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=50).split_text(f.read())
-    
-    if q_client.collection_exists(COLLECTION_NAME): q_client.delete_collection(COLLECTION_NAME)
-    q_client.create_collection(COLLECTION_NAME, vectors_config=models.VectorParams(size=len(get_embeddings(["t"])[0]), distance=models.Distance.COSINE))
-    q_client.upsert(COLLECTION_NAME, points=[models.PointStruct(id=i, vector=v, payload={"page_content": t}) for i, (t, v) in enumerate(zip(all_chunks, get_embeddings(all_chunks)))])
-    bm25 = BM25Okapi([doc.split() for doc in all_chunks])
+    # 讀取檔案
+    try:
+        questions_df = pd.read_csv('questions.csv')
+        truth_df = pd.read_csv('questions_answer.csv')
+    except Exception as e:
+        print(f"檔案讀取失敗: {e}")
+        return
 
-    df_q = pd.read_csv("questions.csv")
-    df_ans = pd.read_csv("questions_answer.csv")
+    # --- 第一階段：RAG 答案生成 ---
+    print(">>> 階段一：生成 RAG 答案...")
+    rag_temp_results = []
 
-    results = []
-    # 使用 max_workers=2 兼顧速度與穩定性
-    print(f"🔥 開始評估 30 題 (並行數: 2)...", flush=True)
-    with ThreadPoolExecutor(max_workers=2) as executor:
-        futures = []
-        for _, row in df_q.iterrows():
-            golden = df_ans[df_ans['q_id'] == row['q_id']]['answer'].values[0]
-            futures.append(executor.submit(process_task, row, golden, bm25, all_chunks))
+    for i, row in questions_df.iterrows():
+        q_id, q_text = row['q_id'], row['questions']
         
-        for f in futures:
-            results.append(f.result())
+        # RAG 鏈
+        keywords = query_rewrite(q_text)
+        contexts = hybrid_search(keywords)
+        final_context = rerank(q_text, contexts)
+        
+        # 生成回答：加強約束避免 AI 亂編
+        context_block = "\n".join(final_context)
+        prompt = f"請嚴格根據參考資料回答。若資料沒寫，請說「抱歉，資料中無此資訊」。\n資料：{context_block}\n問題：{q_text}"
+        answer = llm_chat(prompt)
+        
+        rag_temp_results.append({
+            'q_id': q_id,
+            'questions': q_text,
+            'answer': answer,
+            'contexts_json': json.dumps(final_context, ensure_ascii=False)
+        })
+        print(f"[{i+1}/{len(questions_df)}] 答案生成完成")
 
-    pd.DataFrame(results).sort_values("q_id").to_csv("day6_HW_questions.csv", index=False, encoding="utf-8-sig")
-    print("\n🎉 恭喜！全部題目已處理完成。")
+    # --- 第二階段：DeepEval 指標評測 ---
+    print("\n>>> 階段二：DeepEval 指標評測中...")
+    eval_model = CustomEvalModel(MODEL_NAME)
+    
+    metrics = {
+        "F": FaithfulnessMetric(model=eval_model),
+        "AR": AnswerRelevancyMetric(model=eval_model),
+        "CR": ContextualRecallMetric(model=eval_model),
+        "CP": ContextualPrecisionMetric(model=eval_model),
+        "Crel": ContextualRelevancyMetric(model=eval_model)
+    }
+
+    final_output = []
+    for row in rag_temp_results:
+        q_id = row['q_id']
+        ground_truth = truth_df[truth_df['q_id'] == q_id]['answer'].values[0]
+        ctx_list = json.loads(row['contexts_json'])
+        
+        test_case = LLMTestCase(
+            input=row['questions'],
+            actual_output=row['answer'],
+            retrieval_context=ctx_list,
+            expected_output=ground_truth
+        )
+        
+        scores = {}
+        for k, m in metrics.items():
+            try:
+                m.measure(test_case)
+                scores[k] = m.score
+            except:
+                scores[k] = 0
+        
+        final_output.append({
+            'q_id': q_id,
+            'questions': row['questions'],
+            'answer': row['answer'],
+            'Faithfulness（忠實度）': scores['F'],
+            'Answer_Relevancy（答案相關性）': scores['AR'],
+            'Contextual_Recall（上下文召回率）': scores['CR'],
+            'Contextual_Precision（上下文精確度）': scores['CP'],
+            'Contextual_Relevancy（上下文相關性）': scores['Crel']
+        })
+        print(f"Q_ID {q_id} 評測結束")
+
+    # 儲存最終結果
+    pd.DataFrame(final_output).to_csv('day6_HW_questions.csv', index=False, encoding='utf-8-sig')
+    print("\n>>> 任務結束！請檢查 day6_HW_questions.csv")
 
 if __name__ == "__main__":
     main()
