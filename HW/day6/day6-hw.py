@@ -273,7 +273,7 @@ def run_rag_and_eval(q_id, q_text, ground_truth, metrics):
     scores = {}
     for k, m in metrics.items():
         try: m.measure(test_case); scores[k] = m.score
-        except: scores[k] = 0
+        except Exception as e:print(e)
         
     return {
         'q_id': q_id, 'questions': q_text, 'answer': answer,
