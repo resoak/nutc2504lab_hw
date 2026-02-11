@@ -503,7 +503,10 @@ def main():
     
     # 簡化評測指標（減少 API 調用）
     metrics = {
-        "Relevancy": AnswerRelevancyMetric(model=custom_llm),
+        "Relevancy": AnswerRelevancyMetric(model=custom_llm,include_reason=True),
+        "Faith": FaithfulnessMetric(model=custom_llm,include_reason=True),
+        "Precision":ContextualPrecisionMetric(model=custom_llm,include_reason=True),
+        "Recall":ContextualRecallMetric(model=custom_llm,include_reason=True)
     }
     
     final_output = []
@@ -599,33 +602,115 @@ def main():
                 expected_output=g_truth
             )
             
-            for name, m in metrics.items():
-                try:
-                    m.measure(tc)
-                    print(f"   [*] {name}: {m.score:.2f}")
-                except Exception as e:
-                    print(f"   [!] {name}: 失敗")
-
-            final_output.append({
+            # 建立這一列的結果紀錄
+            row_result = {
                 'q_id': qid, 
                 'questions': qtxt, 
                 'answer': ans, 
                 'source': ",".join(best_sources)
-            })
+            }
+
+            print(f"  評測結果:")
+            for name, m in metrics.items():
+                try:
+                    m.measure(tc)
+                    print(f"   [*] {name}: {m.score:.2f}")
+                    # 將分數與原因存入該列字典
+                    row_result[f'{name}_score'] = m.score
+                    row_result[f'{name}_reason'] = getattr(m, 'reason', 'N/A')
+                except Exception as e:
+                    print(f"   [!] {name} 評測失敗: {e}")
+                    row_result[f'{name}_score'] = 0
+                    row_result[f'{name}_reason'] = "Error"
+
+            final_output.append(row_result)
             
         except Exception as e: 
             print(f"❌ ID {qid} 失敗: {e}")
 
     # 儲存結果
-    if final_output:
-        pd.DataFrame(final_output).to_csv(
-            'test_dataset.csv', 
-            index=False, 
-            encoding='utf-8-sig'
-        )
-        print(f"\n✅ 完成！共生成 {len(final_output)} 個答案")
+    # if final_output:
+    #     pd.DataFrame(final_output).to_csv(
+    #         'test_dataset_final.csv', 
+    #         index=False, 
+    #         encoding='utf-8-sig'
+    #     )
+    #     print(f"\n✅ 完成！共生成 {len(final_output)} 個答案")
+    # else:
+    #     print("\n⚠️  沒有生成答案")
+    # --- 第四階段: 獨立處理 test_dataset.csv (無評測模式) ---
+    if os.path.exists('test_dataset.csv'):
+        print("\n\033[92m>>> [第四階段: 處理 test_dataset.csv]\033[0m")
+        test_df = pd.read_csv('test_dataset.csv')
+        test_final_output = []
+
+        for _, row in test_df.iterrows():
+            try:
+                tid = str(row.get('id', 'N/A'))
+                tqtxt = str(row.get('questions', ''))
+                if not tqtxt: continue
+
+                print(f"[*] 正在處理測試集 ID: {tid}...", end="\r")
+
+                # 1. 檢索
+                t_q_emb = get_embs([tqtxt])[0]
+                t_search_res = q_client.query_points(
+                    collection_name=COLLECTION_NAME,
+                    prefetch=[
+                        models.Prefetch(query=models.Document(text=tqtxt, model="Qdrant/bm25"), using="sparse", limit=20),
+                        models.Prefetch(query=t_q_emb, using="dense", limit=20),
+                    ],
+                    query=models.FusionQuery(fusion=models.Fusion.RRF),
+                    limit=15
+                )
+
+                t_cand_text = [p.payload["text"] for p in t_search_res.points]
+                t_cand_src = [p.payload["source"] for p in t_search_res.points]
+
+                if not t_cand_text:
+                    test_final_output.append({'id': tid, 'questions': tqtxt, 'answer': "查無資料", 'source': ""})
+                    continue
+
+                # 2. Rerank
+                t_rerank_pairs = [[tqtxt, c] for c in t_cand_text]
+                t_inputs = reranker_tokenizer(t_rerank_pairs, padding=True, truncation=True, return_tensors='pt', max_length=512).to(DEVICE)
+                with torch.no_grad():
+                    t_logits = reranker_model(**t_inputs).logits[:, -1, [token_no, token_yes]]
+                    t_scores = torch.softmax(t_logits, dim=-1)[:, 1].tolist()
+
+                # 3. 智能選擇
+                t_objs = []
+                for i in range(len(t_cand_text)):
+                    t_objs.append({
+                        "text": t_cand_text[i],
+                        "score": t_scores[i],
+                        "source": t_cand_src[i],
+                        "orig_idx": i
+                    })
+                
+                t_best_chunks, t_best_srcs, _ = select_best_chunks(t_objs, MAX_CONTEXT_CHARS)
+
+                # 4. 生成答案
+                t_context = "\n\n".join(t_best_chunks)
+                t_prompt = f"請根據以下資料回答問題。\n\n資料：\n{t_context}\n\n問題：{tqtxt}\n\n答案："
+                t_ans = custom_llm.generate(t_prompt)
+
+                test_final_output.append({
+                    'id': tid,
+                    'questions': tqtxt,
+                    'answer': t_ans,
+                    'source': ",".join(list(set(t_best_srcs)))
+                })
+
+            except Exception as e:
+                print(f"\n❌ 測試集 ID {tid} 失敗: {e}")
+
+        # 儲存測試集結果
+        if test_final_output:
+            pd.DataFrame(test_final_output).to_csv('test_dataset_final.csv', index=False, encoding='utf-8-sig')
+            print(f"\n✅ 測試集處理完成，已存至 test_dataset_final.csv")
     else:
-        print("\n⚠️  沒有生成答案")
+        print("\nℹ️ 未發現 test_dataset.csv，跳過此階段。")
 
 if __name__ == "__main__":
     main()
