@@ -21,7 +21,7 @@ from deepeval.test_case import LLMTestCase
 from deepeval.models.base_model import DeepEvalBaseLLM
 
 # --- 1. 配置區域 ---
-CHAT_API_URL = "https://ws-02.wade0426.me/v1/chat/completions"
+CHAT_API_URL = "https://ws-03.wade0426.me/v1/chat/completions"
 EMBED_URL = "https://ws-04.wade0426.me/embed"
 MODEL_NAME = "test"
 # RERANKER_PATH = os.path.expanduser("~/AI/Models/Qwen3-Reranker-0.6B")
@@ -203,8 +203,8 @@ def rerank_best(query, documents):
 class CustomJudge(DeepEvalBaseLLM):
     def __init__(
         self,
-        base_url="https://ws-02.wade0426.me/v1",
-        model_name="local-model"
+        base_url="https://ws-03.wade0426.me/v1/chat/completions",
+        model_name="/models/Qwen3-30B-A3B-Instruct-2507-FP8"
     ):
         self.base_url = base_url
         self.model_name = model_name
@@ -273,7 +273,7 @@ def run_rag_and_eval(q_id, q_text, ground_truth, metrics):
     scores = {}
     for k, m in metrics.items():
         try: m.measure(test_case); scores[k] = m.score
-        except: scores[k] = 0
+        except Exception as e:print(e)
         
     return {
         'q_id': q_id, 'questions': q_text, 'answer': answer,
@@ -290,8 +290,8 @@ def main():
     q_df = pd.read_csv('questions.csv')
     truth_df = pd.read_csv('questions_answer.csv')
     judge = CustomJudge(
-            base_url="https://ws-02.wade0426.me/v1",
-            model_name="your-model-name"
+            base_url="https://ws-03.wade0426.me/v1",
+            model_name="/models/Qwen3-30B-A3B-Instruct-2507-FP8"
         )
     
     metrics = {
